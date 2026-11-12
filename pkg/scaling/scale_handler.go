@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"reflect"
 	"slices"
 	"strconv"
@@ -55,6 +56,7 @@ import (
 	"github.com/kedacore/keda/v2/pkg/scaling/cache"
 	"github.com/kedacore/keda/v2/pkg/scaling/cache/metricscache"
 	"github.com/kedacore/keda/v2/pkg/scaling/executor"
+	"github.com/kedacore/keda/v2/pkg/scaling/lease"
 	"github.com/kedacore/keda/v2/pkg/scaling/modifiers"
 	"github.com/kedacore/keda/v2/pkg/scaling/resolver"
 	"github.com/kedacore/keda/v2/pkg/scaling/scaledjob"
@@ -63,6 +65,14 @@ import (
 var (
 	log = logf.Log.WithName("scale_handler")
 )
+
+// scalerLeaseTTL is the lifetime of the in-memory scaler lease guarding one
+// ScaledObject. It comfortably exceeds the default 30s polling interval so a
+// healthy leader renews it every tick, while bounding how long a new leader
+// waits after the previous leader's last successful tick before it may take
+// over. The lease is a pure in-process plan and never touches the Kubernetes
+// API.
+const scalerLeaseTTL = 2 * time.Minute
 
 // ScaleHandler encapsulates the logic of calling the right scalers for
 // each ScaledObject and making the final scale decision and operation
@@ -103,11 +113,18 @@ type scaleHandler struct {
 	// metricSpecReconcileCh delivers reconcile requests for ScaledObjects whose
 	// external-push scalers have streamed updated metric specs.
 	metricSpecReconcileCh chan event.GenericEvent
+	// leaseManager guards ScaledObject scale submissions across leader
+	// transitions. It is nil when initialization fails, in which case scale
+	// submissions proceed without lease fencing (legacy behavior).
+	leaseManager *lease.Manager
+	// leaseHolder is the leader identity (operator pod hostname) presented when
+	// acquiring scaler leases.
+	leaseHolder lease.Holder
 }
 
 // NewScaleHandler creates a ScaleHandler object
 func NewScaleHandler(client client.Client, scaleClient scale.ScalesGetter, reconcilerScheme *runtime.Scheme, globalHTTPTimeout, kubernetesAPITimeout time.Duration, recorder events.EventRecorder, authClientSet *authentication.AuthClientSet) ScaleHandler {
-	return &scaleHandler{
+	handler := &scaleHandler{
 		client:                   client,
 		scaleClient:              scaleClient,
 		scaleLoopContexts:        &sync.Map{},
@@ -124,6 +141,21 @@ func NewScaleHandler(client client.Client, scaleClient scale.ScalesGetter, recon
 		subsLock:                 &sync.RWMutex{},
 		metricSpecReconcileCh:    make(chan event.GenericEvent, 1024),
 	}
+
+	holderID, err := os.Hostname()
+	if err != nil || holderID == "" {
+		log.Error(err, "could not resolve operator hostname, falling back to generic scaler lease holder")
+		holderID = "keda-operator"
+	}
+	leaseManager, err := lease.NewManager(scalerLeaseTTL, nil)
+	if err != nil {
+		log.Error(err, "failed to initialize scaler lease manager, leader-transition scale fencing is disabled")
+	} else {
+		handler.leaseManager = leaseManager
+		handler.leaseHolder = lease.Holder(holderID)
+	}
+
+	return handler
 }
 
 // MetricSpecReconcileChan returns the channel of reconcile requests triggered
@@ -270,6 +302,9 @@ func (h *scaleHandler) DeleteScalableObject(ctx context.Context, scalableObject 
 	if err := h.ClearScalersCache(ctx, scalableObject); err != nil {
 		log.Error(err, "error clearing scalers cache", "scalableObject", scalableObject, "key", key)
 	}
+	if h.leaseManager != nil {
+		h.leaseManager.Remove(lease.ObjectID(key))
+	}
 
 	if hasScaleLoopContext {
 		h.recorder.Eventf(withTriggers, nil, corev1.EventTypeNormal, eventreason.KEDAScalersStopped, eventreason.KEDAScalersStopped, "%s", "Stopped scalers watch")
@@ -366,9 +401,16 @@ func (h *scaleHandler) startPushScalers(ctx context.Context, withTriggers *kedav
 							ActiveTriggers:      []string{metricName},
 						}
 						scalingMutex.Lock()
-						result := h.scaleExecutor.RequestScale(ctx, freshSO, active, false, opts)
-						h.handleResult(ctx, freshSO, result)
-						scalingMutex.Unlock()
+						func() {
+							defer scalingMutex.Unlock()
+							leaseHandle, requestID, canSubmit := h.beginScalerLease(freshSO)
+							if !canSubmit {
+								return
+							}
+							result := h.scaleExecutor.RequestScale(ctx, freshSO, active, false, opts)
+							h.handleResult(ctx, freshSO, result)
+							h.endScalerLease(leaseHandle, requestID, result)
+						}()
 					case *kedav1alpha1.ScaledJob:
 						logger.Info("Warning: External Push Scaler does not support ScaledJob", "object", scalableObject)
 					}
@@ -470,6 +512,56 @@ func (h *scaleHandler) handleResult(ctx context.Context, obj kedav1alpha1.Scalab
 	}
 }
 
+// beginScalerLease claims the per-ScaledObject scaler lease for this leader
+// and registers exactly one scale submission for the upcoming RequestScale
+// call. The third return value is false when the scale decision must be
+// skipped this round: another leader still holds an unexpired lease, the same
+// submission is already in flight, or the lease epoch was fenced. A nil lease
+// manager disables the mechanism and always allows the submission, preserving
+// the legacy behavior.
+func (h *scaleHandler) beginScalerLease(scaledObject *kedav1alpha1.ScaledObject) (lease.Handle, string, bool) {
+	if h.leaseManager == nil {
+		return lease.Handle{}, "", true
+	}
+
+	objectID := lease.ObjectID(scaledObject.GenerateIdentifier())
+	handle, err := h.leaseManager.Acquire(objectID, h.leaseHolder, scalerLeaseTTL, "")
+	if err != nil {
+		log.V(1).Info("scaler lease not acquired, skipping scale submission", "scaledObject.Namespace", scaledObject.Namespace, "scaledObject.Name", scaledObject.Name, "error", err)
+		return lease.Handle{}, "", false
+	}
+
+	requestID, err := h.leaseManager.NewRequestID(handle)
+	if err != nil {
+		log.Error(err, "failed to mint scaler lease request id, skipping scale submission", "scaledObject.Namespace", scaledObject.Namespace, "scaledObject.Name", scaledObject.Name)
+		return lease.Handle{}, "", false
+	}
+
+	if _, err := h.leaseManager.BeginSubmission(handle, requestID); err != nil {
+		log.V(1).Info("scaler lease submission rejected, skipping scale submission", "scaledObject.Namespace", scaledObject.Namespace, "scaledObject.Name", scaledObject.Name, "requestID", requestID, "error", err)
+		return lease.Handle{}, "", false
+	}
+
+	return handle, requestID, true
+}
+
+// endScalerLease records the scale result for the submission and renews the
+// lease so a healthy leader keeps the object across polling ticks. A late
+// acknowledgment from a deposed epoch is rejected by the manager and leaves
+// the new leader's lease untouched.
+func (h *scaleHandler) endScalerLease(handle lease.Handle, requestID string, result executor.ScaleResult) {
+	if h.leaseManager == nil || requestID == "" {
+		return
+	}
+
+	if err := h.leaseManager.AckSubmission(handle, requestID, result.Error); err != nil {
+		log.Error(err, "failed to acknowledge scaler lease submission", "requestID", requestID)
+	}
+	if _, err := h.leaseManager.Renew(handle, scalerLeaseTTL); err != nil {
+		log.Error(err, "failed to renew scaler lease", "requestID", requestID)
+	}
+}
+
 // checkScalers contains the main logic for the ScaleHandler scaling logic.
 // It'll check each trigger active status then call RequestScale
 func (h *scaleHandler) checkScalers(ctx context.Context, scalableObject kedav1alpha1.ScalableObject, scalingMutex sync.Locker) {
@@ -495,8 +587,13 @@ func (h *scaleHandler) checkScalers(ctx context.Context, scalableObject kedav1al
 			h.recorder.Eventf(obj, nil, corev1.EventTypeNormal, eventreason.ScaledObjectFallbackDeactivated, eventreason.ScaledObjectFallbackDeactivated, "%s", message.ScaledObjectFallbackDeactivatedMsg)
 		}
 
+		leaseHandle, requestID, canSubmit := h.beginScalerLease(obj)
+		if !canSubmit {
+			return
+		}
 		result := h.scaleExecutor.RequestScale(ctx, obj, isActive, isError, executor.ScaleExecutorOptions{ActiveTriggers: activeTriggers})
 		h.handleResult(ctx, obj, result)
+		h.endScalerLease(leaseHandle, requestID, result)
 
 		if len(metricsRecords) > 0 {
 			log.V(1).Info("Storing metrics to cache", "scaledObject.Namespace", obj.Namespace, "scaledObject.Name", obj.Name, "metricsRecords", metricsRecords)
