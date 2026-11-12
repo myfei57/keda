@@ -228,7 +228,7 @@ func (e *scaleExecutor) generateJobs(logger logr.Logger, scaledJob *kedav1alpha1
 	return jobs
 }
 
-func (e *scaleExecutor) isJobFinished(j *batchv1.Job) bool {
+func isJobFinished(j *batchv1.Job) bool {
 	for _, c := range j.Status.Conditions {
 		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) && c.Status == corev1.ConditionTrue {
 			return true
@@ -253,7 +253,7 @@ func (e *scaleExecutor) getRunningJobCount(ctx context.Context, scaledJob *kedav
 	}
 
 	for _, job := range jobs.Items {
-		if !e.isJobFinished(&job) {
+		if !isJobFinished(&job) {
 			runningJobs++
 		}
 	}
@@ -336,7 +336,7 @@ func (e *scaleExecutor) getPendingJobCount(ctx context.Context, scaledJob *kedav
 	}
 
 	for _, job := range jobs.Items {
-		if !e.isJobFinished(&job) {
+		if !isJobFinished(&job) {
 			if len(scaledJob.Spec.ScalingStrategy.PendingPodConditions) > 0 {
 				if !e.areAllPendingPodConditionsFulfilled(ctx, &job, scaledJob.Spec.ScalingStrategy.PendingPodConditions) {
 					pendingJobs++
@@ -371,7 +371,7 @@ func (e *scaleExecutor) cleanUp(ctx context.Context, scaledJob *kedav1alpha1.Sca
 	var completedJobs []batchv1.Job
 	var failedJobs []batchv1.Job
 	for _, job := range jobs.Items {
-		finishedJobConditionType := e.getFinishedJobConditionType(&job)
+		finishedJobConditionType := getFinishedJobConditionType(&job)
 		switch finishedJobConditionType {
 		case batchv1.JobComplete:
 			completedJobs = append(completedJobs, job)
@@ -435,7 +435,7 @@ func (c byCompletedTime) Less(i, j int) bool {
 }
 func (c byCompletedTime) Swap(i, j int) { c[i], c[j] = c[j], c[i] }
 
-func (e *scaleExecutor) getFinishedJobConditionType(j *batchv1.Job) batchv1.JobConditionType {
+func getFinishedJobConditionType(j *batchv1.Job) batchv1.JobConditionType {
 	for _, c := range j.Status.Conditions {
 		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) && c.Status == corev1.ConditionTrue {
 			return c.Type

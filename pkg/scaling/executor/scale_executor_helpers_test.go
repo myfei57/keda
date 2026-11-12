@@ -82,8 +82,6 @@ func TestGetIdleOrMinimumReplicaCount(t *testing.T) {
 }
 
 func TestIsJobFinished(t *testing.T) {
-	e := &scaleExecutor{}
-
 	tests := []struct {
 		name     string
 		job      batchv1.Job
@@ -130,14 +128,12 @@ func TestIsJobFinished(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, e.isJobFinished(&tt.job))
+			assert.Equal(t, tt.expected, isJobFinished(&tt.job))
 		})
 	}
 }
 
 func TestGetFinishedJobConditionType(t *testing.T) {
-	e := &scaleExecutor{}
-
 	tests := []struct {
 		name     string
 		job      batchv1.Job
@@ -184,7 +180,7 @@ func TestGetFinishedJobConditionType(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, e.getFinishedJobConditionType(&tt.job))
+			assert.Equal(t, tt.expected, getFinishedJobConditionType(&tt.job))
 		})
 	}
 }
